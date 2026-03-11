@@ -1,4 +1,5 @@
 class Meeting:
+    """Represents a scheduled meeting."""
     def __init__(self, person_name, name, start_time, end_time):
         self.person_name = person_name
         self.name = name
