@@ -1,59 +1,138 @@
-from datetime import datetime, timedelta, time
-from typing import List
+"""
+Calendar scheduling service.
+Core business logic for finding free time slots across multiple participants.
+"""
+import logging
+from datetime import datetime, timedelta, time, date
+from typing import List, Tuple
+
 from models.models import Meeting
+from repositories.meeting_repository import MeetingRepository
+from config import SchedulerConfig, DEFAULT_CONFIG
+from exceptions import SchedulingError
 
-# Business hour boundaries (as plain time constants)
-_DAY_START_TIME = time(7, 0)
-_DAY_END_TIME = time(19, 0)
+logger = logging.getLogger(__name__)
 
-def find_available_slots(person_list: List[str], event_duration: timedelta, all_meetings: List[Meeting]):
+# Type alias for a time window
+TimeWindow = Tuple[time, time]
+
+
+class CalendarService:
     """
-    Core business logic to find free time slots for multiple participants.
+    Service for finding available meeting slots.
+    Repository and config are injected via the constructor (Dependency Injection).
     """
-    # Compute datetime boundaries anchored to today, inside the function
-    # so they always reflect the actual current date at call time.
-    ref_date = datetime.today().date()
-    DAY_START = datetime.combine(ref_date, _DAY_START_TIME)
-    DAY_END = datetime.combine(ref_date, _DAY_END_TIME)
 
-    relevant_meetings = []
-    for meeting in all_meetings:
-        if meeting.person_name in person_list:
-            start = datetime.combine(ref_date, meeting.start_time)
-            end = datetime.combine(ref_date, meeting.end_time)
-            relevant_meetings.append([start, end]) 
-    
-    if not relevant_meetings:
-        latest_start = (DAY_END - event_duration).time()
-        if datetime.combine(ref_date, latest_start) >= DAY_START:
-            return [(DAY_START.time(), latest_start)]
-        return []
-    
-    relevant_meetings.sort()
-    merged = []
-    curr_start, curr_end = relevant_meetings[0]
+    def __init__(
+        self,
+        repository: MeetingRepository,
+        config: SchedulerConfig = DEFAULT_CONFIG,
+    ) -> None:
+        self._repository = repository
+        self._config = config
 
-    for next_start, next_end in relevant_meetings[1:]:
-        if next_start < curr_end:
+    def find_available_slots(
+        self,
+        person_list: List[str],
+        event_duration: timedelta,
+    ) -> List[TimeWindow]:
+        """
+        Find all free time windows in which all participants are available.
+
+        Args:
+            person_list:    Names of the required participants.
+            event_duration: Required length of the meeting.
+
+        Returns:
+            List of (earliest_start, latest_start) time windows.
+
+        Raises:
+            SchedulingError: If event_duration exceeds the working day.
+        """
+        ref_date = datetime.today().date()
+        day_start = datetime.combine(ref_date, self._config.day_start)
+        day_end = datetime.combine(ref_date, self._config.day_end)
+
+        if event_duration > day_end - day_start:
+            raise SchedulingError(
+                f"Requested duration {event_duration} exceeds the working day."
+            )
+
+        all_meetings = self._repository.load_meetings()
+        busy_blocks = _collect_busy_blocks(person_list, all_meetings, ref_date)
+
+        if not busy_blocks:
+            logger.debug("No meetings found for %s — returning full day", person_list)
+            return _full_day_window(day_start, day_end, event_duration)
+
+        merged = _merge_overlapping(busy_blocks)
+        return _gaps_as_windows(merged, day_start, day_end, event_duration)
+
+
+# ---------------------------------------------------------------------------
+# Private module-level helpers
+# ---------------------------------------------------------------------------
+
+def _collect_busy_blocks(
+    person_list: List[str],
+    all_meetings: List[Meeting],
+    ref_date: date,
+) -> List[Tuple[datetime, datetime]]:
+    """Return sorted (start, end) datetime pairs for the relevant participants."""
+    blocks = [
+        (datetime.combine(ref_date, m.start_time), datetime.combine(ref_date, m.end_time))
+        for m in all_meetings
+        if m.person_name in person_list
+    ]
+    return sorted(blocks)
+
+
+def _merge_overlapping(
+    blocks: List[Tuple[datetime, datetime]],
+) -> List[Tuple[datetime, datetime]]:
+    """Merge overlapping/adjacent busy blocks into a minimal list."""
+    merged: List[Tuple[datetime, datetime]] = []
+    curr_start, curr_end = blocks[0]
+
+    for next_start, next_end in blocks[1:]:
+        if next_start <= curr_end:
             curr_end = max(curr_end, next_end)
         else:
             merged.append((curr_start, curr_end))
             curr_start, curr_end = next_start, next_end
+
     merged.append((curr_start, curr_end))
+    return merged
 
-    available_windows = []
-    last_end = DAY_START
 
-    for start, end in merged:
-        window_start = max(last_end, DAY_START)
-        if start - window_start >= event_duration:
-            latest_possible_start = start - event_duration
-            available_windows.append((window_start.time(), latest_possible_start.time()))
-        
-        last_end = max(last_end, end)
+def _full_day_window(
+    day_start: datetime,
+    day_end: datetime,
+    event_duration: timedelta,
+) -> List[TimeWindow]:
+    """Return a single window covering the whole working day."""
+    latest_start = day_end - event_duration
+    return [(day_start.time(), latest_start.time())]
 
-    if DAY_END - last_end >= event_duration:
-        latest_possible_start = DAY_END - event_duration
-        available_windows.append((last_end.time(), latest_possible_start.time()))
 
-    return available_windows
+def _gaps_as_windows(
+    merged: List[Tuple[datetime, datetime]],
+    day_start: datetime,
+    day_end: datetime,
+    event_duration: timedelta,
+) -> List[TimeWindow]:
+    """Convert merged busy blocks into a list of available time windows."""
+    windows: List[TimeWindow] = []
+    last_end = day_start
+
+    for block_start, block_end in merged:
+        window_start = max(last_end, day_start)
+        if block_start - window_start >= event_duration:
+            latest_start = block_start - event_duration
+            windows.append((window_start.time(), latest_start.time()))
+        last_end = max(last_end, block_end)
+
+    if day_end - last_end >= event_duration:
+        windows.append((last_end.time(), (day_end - event_duration).time()))
+
+    return windows
